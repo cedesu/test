@@ -33,7 +33,7 @@ import operator
 from collections import deque
 from multiprocessing import Pool
 
-
+from collections import Counter
 #################### utils for system #############################
 
 # seed everything
@@ -157,13 +157,15 @@ class Model():
 
         # feature generation
         self.is_use_counts_f = True
-        self.is_use_bicounts_f = True
+        self.is_use_bicounts_f = False#True
         self.is_binum_cross = False
-        self.is_rank = True
-        self.is_target = True
+        self.is_rank = False#True
+        self.is_target = False#True
         self.is_bi_target = False
         self.target_off = 3
         self.is_time = True
+        self.is_ti=False
+        self.is_num_rank=False
 
         # class matience
         self.drop_name = []
@@ -207,6 +209,8 @@ class Model():
             'two_round': False,
             # 'boost_from_average': False,
         }
+
+        self.featureMap={}
 
     def fit(self, F, y, datainfo, timeinfo):
         if self.batch_idx == 1:
@@ -403,7 +407,6 @@ class Model():
 
     @timmer
     def feature_extraction(self, df_train, is_train=False):
-        print("shape before feature_extraction", df_train.shape)
         if self.is_time:
             df_train = self.bi_time_count(df_train)
         if self.is_use_counts_f:
@@ -418,7 +421,17 @@ class Model():
             df_train = self.calc_target_encoding(df_train, is_train)
         if self.is_bi_target:
             df_train = self.bi_target_encoding(df_train)
+        if self.is_ti:
+            df_train = self.ti_encode(df_train)
+        if self.is_num_rank:
+            df_train = self.num_group_by_encoding(df_train)
         print("shape after feature_extraction", df_train.shape)
+        for i in range(self.ncat):
+            if 'cat_'+str(i) in df_train.columns:
+                df_train.drop('cat_'+str(i),axis=1)
+        for i in range(self.nmv):
+            if 'mv_'+str(i) in df_train.columns:
+                df_train.drop('mv_'+str(i),axis=1)
         return df_train
 
     def count_encode(self, df):
@@ -440,6 +453,25 @@ class Model():
         gc.collect()
         count_result.append(df)
         df = concat(count_result)
+        num_df1 = df.shape[1]
+        print("number of count feature is {}".format(num_df1 - num_df0))
+        #    #df['count_' + i] = df[[i]].groupby(i)[i].transform('count') / df.shape[0]
+        return df
+    def count_encode_new(self, df):
+        num_df0 = df.shape[1]
+        import_cat_col = self.get_imp_fea_seperate('CAT+MV', 1)
+        for i in import_cat_col:
+            if i in self.drop_name:
+                continue
+            if i not in self.featureMap:
+                self.featureMap[i]={}
+            curr_featureMap = dict(pd.value_counts(df[i]))
+            self.featureMap[i] = dict(Counter(self.featureMap[i]) + Counter(curr_featureMap))
+            keys = self.featureMap[i].keys()
+            vals = np.array(list(self.featureMap[i].values())).astype(float)
+            freqMap = dict(zip(keys, vals))
+            freq_encoded_col = np.vectorize(freqMap.get)(df[i].values)
+            df['count_'+i]=freq_encoded_col
         num_df1 = df.shape[1]
         print("number of count feature is {}".format(num_df1 - num_df0))
         #    #df['count_' + i] = df[[i]].groupby(i)[i].transform('count') / df.shape[0]
@@ -532,9 +564,34 @@ class Model():
                     continue
                 df['ke_cnt_' + col] = df.groupby(col)[self.time_col].rank(ascending=False)
                 df2 = df[[col, 'ke_cnt_' + col, self.time_col]].copy()
+                #df2=df2.drop_duplicates()
                 df2['ke_cnt_' + col] = df2['ke_cnt_' + col] - 1
                 df3 = pd.merge(df, df2, on=[col, 'ke_cnt_' + col], how='left')
                 df['ke_time_' + col] = df3[self.time_col + '_x'] - df3[self.time_col + '_y']
+                del df2, df3
+                gc.collect()
+        return df
+    def num_group_by_encoding(self, df):
+        if self.ntime == 0:
+            count_rate = 1
+        else:
+            count_rate = self.count_rate
+        import_num_col = self.get_imp_fea_seperate('NUM', count_rate)[:4]
+        for i in import_num_col:
+            if i in self.drop_name:
+                continue
+            import_cat_col = self.get_imp_fea_seperate('CAT+MV', self.gp_rate)
+            # import_mv_col = self.get_imp_fea_seperate('MV', self.count_rate)
+            import_cat_col=import_cat_col[:5]
+            for col in import_cat_col:
+                if col in self.drop_name:
+                    continue
+                df['num_ke_cnt_' + i+'_'+col] = df.groupby(col)[i].rank(ascending=False)
+                df2 = df[[col, 'num_ke_cnt_' +i+'_'+ col, i]].copy()
+                #df2=df2.drop_duplicates()
+                df2['num_ke_cnt_' + i+'_'+col] = df2['num_ke_cnt_' + i+'_'+col] - 1
+                df3 = pd.merge(df, df2, on=[col, 'num_ke_cnt_' + i+'_'+col], how='left')
+                df['num_ke_time_' + i+'_'+col] = df3[i + '_x'] - df3[i + '_y']
                 del df2, df3
                 gc.collect()
         return df
@@ -655,6 +712,48 @@ class Model():
         df = concat(bi_count_results)
         num_df1 = df.shape[1]
         print("number of bi_time_count feature is {}".format(num_df1 - num_df0))
+        return df
+
+    def ti_encode(self, df):
+        num_df0 = df.shape[1]
+        year=np.empty(df.shape[0])
+        month=np.empty(df.shape[0])
+        dayofmonth=np.empty(df.shape[0])
+        hour=np.empty(df.shape[0])
+        minute=np.empty(df.shape[0])
+        second=np.empty(df.shape[0])
+        dayofweek=np.empty(df.shape[0])
+        for i in range(self.ntime):
+            if 'time_'+str(i) in self.drop_name:
+                continue
+            for j in range(i+1,self.ntime):
+                if 'time_'+str(j) in self.drop_name:
+                    continue
+                if len(np.nonzero(df['time_'+str(i)]))>0 and len(np.nonzero(df['time_'+str(j)]))>0:
+                    print('AutoGBT[GenericStreamPreprocessor]:datediff from nonzero cols:',i,j)
+                    df['ti_'+str(i)+'-'+str(j)]=df['time_'+str(i)]-df['time_'+str(j)]
+            timestamp = np.nan_to_num(df['time_'+str(i)].values).astype(int)
+            for j in range(timestamp.shape[0]):
+                dates=time.localtime(timestamp[j])
+                year[j] = dates[0]
+                month[j] = dates[1]
+                dayofmonth[j] = dates[2]
+                hour[j] = dates[3]
+                minute[j] = dates[4]
+                second[j] = dates[5]
+                dayofweek[j] = dates[6]
+            #dates = time.localtime(np.nan_to_num(df['time_'+str(i)].values).astype(int))
+
+            df['ti_year_'+str(i)]=year
+            df['ti_month_'+str(i)]=month
+            df['ti_dayofmonth_'+str(i)]=dayofmonth
+            df['ti_hour_'+str(i)]=hour
+            df['ti_minute_'+str(i)]=minute
+            df['ti_second_'+str(i)]=second
+            df['ti_dayofweek_'+str(i)]=dayofweek
+        num_df1 = df.shape[1]
+        print("number of ti feature is {}".format(num_df1 - num_df0))
+        #    #df['count_' + i] = df[[i]].groupby(i)[i].transform('count') / df.shape[0]
         return df
 
     def cat_encode(self, df):
@@ -955,7 +1054,7 @@ class Model():
         print("----Adversial Score is {}------".format(auc))
         fea_importance_adversial = self.get_fea_importance(lgb_model, feature_name)
         self.adversial_drop = list(fea_importance_adversial['feature'][fea_importance_adversial.gain_percent > 15])
-        print(fea_importance_adversial.head(10))
+        print(fea_importance_adversial.head())
         return
 
     @timmer
@@ -1382,3 +1481,47 @@ class Model():
         result, best_iter = hyperband_tuner.run()
         # return result['param'], result['best_iter']
         return result, best_iter
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    ""
