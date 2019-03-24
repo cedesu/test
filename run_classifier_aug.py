@@ -32,7 +32,8 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
 
 from pytorch_pretrained_bert.file_utils import PYTORCH_PRETRAINED_BERT_CACHE
-from pytorch_pretrained_bert.modeling import BertForSequenceClassification, BertConfig, WEIGHTS_NAME, CONFIG_NAME,BertForPreTraining
+from pytorch_pretrained_bert.modeling_gan import BertForSequenceClassification, BertConfig, WEIGHTS_NAME, CONFIG_NAME,BertForPreTraining
+from pytorch_pretrained_bert import modeling
 from pytorch_pretrained_bert.tokenization import BertTokenizer
 from pytorch_pretrained_bert.optimization import BertAdam, warmup_linear
 
@@ -279,7 +280,7 @@ def convert_examples_to_features(examples, label_list, max_seq_length, tokenizer
         assert len(segment_ids) == max_seq_length
         assert len(aug_mask) == max_seq_length
 
-        if random.random()<0.5:
+        if random.random()<0:
             aug_mask=[0]*max_seq_length
 
         label_id = label_map[example.label]
@@ -504,13 +505,13 @@ def main():
 
     # Prepare model
     cache_dir = args.cache_dir if args.cache_dir else os.path.join(PYTORCH_PRETRAINED_BERT_CACHE, 'distributed_{}'.format(args.local_rank))
-    model = BertForSequenceClassification.from_pretrained(args.bert_model,cache_dir=cache_dir,num_labels = num_labels)
+    model = modeling.BertForSequenceClassification.from_pretrained(args.bert_model,cache_dir=cache_dir,num_labels = num_labels)
     if args.con_model!=None:
         model.load_state_dict(torch.load(os.path.join(arg.con_model,'pytorch_model.bin')))
     if args.fp16:
         model.half()
     model.to(device)
-    '''if args.local_rank != -1:
+    if args.local_rank != -1:
         try:
             from apex.parallel import DistributedDataParallel as DDP
         except ImportError:
@@ -518,23 +519,40 @@ def main():
 
         model = DDP(model)
     elif n_gpu > 1:
-        model = torch.nn.DataParallel(model)'''
+        model = torch.nn.DataParallel(model)
 
     model_aug = BertForPreTraining.from_pretrained(args.bert_model)
     if args.fp16:
         model_aug.half()
     model_aug.to(device)
-    '''if args.local_rank != -1:
+    if args.local_rank != -1:
         try:
             from apex.parallel import DistributedDataParallel as DDP
         except ImportError:
             raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training.")
         model_aug = DDP(model_aug)
     elif n_gpu > 1:
-        model_aug = torch.nn.DataParallel(model_aug)'''
-    for param in model_aug.parameters():
-        param.requires_grad=False
-    model_aug.eval()
+        model_aug = torch.nn.DataParallel(model_aug)
+    #for param in model_aug.parameters():
+    #    param.requires_grad=False
+
+    cache_dir = args.cache_dir if args.cache_dir else os.path.join(PYTORCH_PRETRAINED_BERT_CACHE,
+                                                                   'distributed_{}'.format(args.local_rank))
+    model_d = BertForSequenceClassification.from_pretrained(args.bert_model, cache_dir=cache_dir, num_labels=num_labels)
+    if args.fp16:
+        model_d.half()
+    model_d.to(device)
+    if args.local_rank != -1:
+        try:
+            from apex.parallel import DistributedDataParallel as DDP
+        except ImportError:
+            raise ImportError(
+                "Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training.")
+        model_d = DDP(model_d)
+    elif n_gpu > 1:
+        model_d = torch.nn.DataParallel(model_d)
+    #for param in model_d.parameters():
+    #    param.requires_grad = False
 
     # Prepare optimizer
     param_optimizer = list(model.named_parameters())
@@ -565,9 +583,94 @@ def main():
                              warmup=args.warmup_proportion,
                              t_total=num_train_optimization_steps)
 
+    closs=torch.nn.CrossEntropyLoss(ignore_index=0)
+    lambda_k=[1,0.5,0.5,0.1,0.1]
+    train_g=[True,False,True,False,True]
+
     global_step = 0
     nb_tr_steps = 0
     tr_loss = 0
+    # train gan
+    print('start training gan')
+    if args.do_train:
+        train_features = convert_examples_to_features(
+            train_examples, label_list, args.max_seq_length, tokenizer)
+        logger.info("***** Running training *****")
+        logger.info("  Num examples = %d", len(train_examples))
+        logger.info("  Batch size = %d", args.train_batch_size)
+        logger.info("  Num steps = %d", num_train_optimization_steps)
+        all_input_ids = torch.tensor([f.input_ids for f in train_features], dtype=torch.long)
+        all_input_mask = torch.tensor([f.input_mask for f in train_features], dtype=torch.long)
+        all_segment_ids = torch.tensor([f.segment_ids for f in train_features], dtype=torch.long)
+        all_label_ids = torch.tensor([f.label_id for f in train_features], dtype=torch.long)
+        all_aug_mask = torch.tensor([f.aug_mask for f in train_features], dtype=torch.long)
+        train_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids,all_aug_mask)
+        if args.local_rank == -1:
+            train_sampler = RandomSampler(train_data)
+        else:
+            train_sampler = DistributedSampler(train_data)
+        train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=args.train_batch_size)
+
+        output_eval_file = os.path.join(args.output_dir, "eval_results.txt")
+        f=open(output_eval_file, "w")
+        for epoch_i in trange(int(0), desc="Epoch"):
+            model.train()
+            tr_loss_g,tr_loss_d = 0,0
+            nb_tr_examples, nb_tr_steps = 0, 0
+            start=time.time()
+            for step, batch in enumerate(tqdm(train_dataloader, desc="Iteration")):
+                batch = tuple(t.to(device) for t in batch)
+                input_ids, input_mask, segment_ids, label_ids, aug_mask = batch
+                if True:
+                    logits,_ = model_aug(input_ids, segment_ids, input_mask, None,None,label_ids)
+                    _,input_ids_aug=logits.max(-1)
+                    input_ids_g=input_ids*(1-aug_mask)+input_ids_aug*aug_mask
+                    loss_g=lambda_k[epoch_i]*closs(logits.view(-1,logits.shape[-1]),(input_ids*aug_mask).view(-1))
+                #loss = model_d(input_ids, segment_ids, input_mask, label_ids)
+                pred_real=model_d(input_ids, segment_ids, input_mask,None,label_ids)
+                pred_fake=model_d(input_ids_g, segment_ids, input_mask,None,label_ids)
+                loss_g+=-pred_fake.mean()*(1-lambda_k[epoch_i])
+                loss_d=-pred_real.mean()+pred_fake.mean()
+                if n_gpu > 1:
+                    loss_g = loss_g.mean() # mean() to average on multi-gpu.
+                    loss_d = loss_d.mean() # mean() to average on multi-gpu.
+                if args.gradient_accumulation_steps > 1:
+                    loss_g = loss_g / args.gradient_accumulation_steps
+                    loss_d = loss_d / args.gradient_accumulation_steps
+
+                tr_loss_g += loss_g.item()
+                tr_loss_d += loss_d.item()
+                nb_tr_examples += input_ids.size(0)
+                nb_tr_steps += 1
+                if (step + 1) % args.gradient_accumulation_steps == 0:
+                    if train_g[epoch_i]:
+                        for param in model_aug.parameters():
+                            param.requires_grad = True
+                        for param in model_d.parameters():
+                            param.requires_grad = False
+                        loss_g = torch.autograd.Variable(loss_g, requires_grad=True)
+                        loss_g.backward()
+                        optimizer.step()
+                        optimizer.zero_grad()
+                    else:
+                        for param in model_aug.parameters():
+                            param.requires_grad = False
+                        for param in model_d.parameters():
+                            param.requires_grad = True
+                        loss_d = torch.autograd.Variable(loss_d, requires_grad=True)
+                        loss_d.backward()
+                        optimizer.step()
+                        optimizer.zero_grad()
+                    global_step += 1
+
+            out={'epoch':epoch_i,'loss_g':tr_loss_g/(step+1),'loss_d':tr_loss_d/(step+1),'time':time.time()-start}
+            logger.info("Train Loss: %s",out)
+            f.write("Train Loss: %s\n"%out)
+    model_aug.eval()
+    for param in model_aug.parameters():
+        param.requires_grad = False
+    # train classifier
+    print('start training classifier')
     if args.do_train:
         train_features = convert_examples_to_features(
             train_examples, label_list, args.max_seq_length, tokenizer)
@@ -598,7 +701,7 @@ def main():
                 batch = tuple(t.to(device) for t in batch)
                 input_ids, input_mask, segment_ids, label_ids, aug_mask = batch
                 if True:
-                    logits,_ = model_aug(input_ids, segment_ids, input_mask)
+                    logits,_ = model_aug(input_ids, segment_ids, input_mask,None,None,label_ids)
                     _,input_ids_aug=logits.max(-1)
                     input_ids=input_ids*(1-aug_mask)+input_ids_aug*aug_mask
                 loss = model(input_ids, segment_ids, input_mask, label_ids)
@@ -725,7 +828,6 @@ def main():
                 f.write("Test Loss: %s\n" % result)
 
 
-
     if args.do_train:
         # Save a trained model and the associated configuration
         model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model it-self
@@ -737,7 +839,7 @@ def main():
 
         # Load a trained model and config that you have fine-tuned
         config = BertConfig(output_config_file)
-        model = BertForSequenceClassification(config, num_labels=num_labels)
+        model = modeling.BertForSequenceClassification(config, num_labels=num_labels)
         model.load_state_dict(torch.load(output_model_file))
     else:
         model = BertForSequenceClassification.from_pretrained(args.bert_model, num_labels=num_labels)
