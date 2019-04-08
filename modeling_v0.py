@@ -241,13 +241,14 @@ class BertEmbeddings(nn.Module):
         self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
         self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
         self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
+        #self.label_embeddings=nn.Embedding(3,config.hidden_size)
 
         # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
         # any TensorFlow checkpoint file
         self.LayerNorm = BertLayerNorm(config.hidden_size, eps=1e-12)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def forward(self, input_ids, token_type_ids=None):
+    def forward(self, input_ids, token_type_ids=None,label_ids=None):
         seq_length = input_ids.size(1)
         position_ids = torch.arange(seq_length, dtype=torch.long, device=input_ids.device)
         position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
@@ -257,8 +258,9 @@ class BertEmbeddings(nn.Module):
         words_embeddings = self.word_embeddings(input_ids)
         position_embeddings = self.position_embeddings(position_ids)
         token_type_embeddings = self.token_type_embeddings(token_type_ids)
+        #label_embeddings=self.label_embeddings(label_ids.unsqueeze(1))
 
-        embeddings = words_embeddings + position_embeddings + token_type_embeddings
+        embeddings = words_embeddings + position_embeddings + token_type_embeddings#+label_embeddings
         embeddings = self.LayerNorm(embeddings)
         embeddings = self.dropout(embeddings)
         return embeddings
@@ -281,25 +283,45 @@ class BertSelfAttention(nn.Module):
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
 
+        import numpy as np
+        a=np.eye(128)
+        for i in range(3):
+            a[i+1:,:-(i+1)]+=np.eye(128-i-1)
+        self.mask1=torch.from_numpy(a)
+        self.mask1=self.mask1.unsqueeze(0).unsqueeze(1)
+        self.mask1=self.mask1.to(dtype=next(self.parameters()).dtype)
+        self.mask1 = (1.0 - self.mask1) * -10000.0
+        self.mask1=self.mask1.cuda()
+        print(self.mask1.shape,self.mask1.dtype)
+
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
         x = x.view(*new_x_shape)
         return x.permute(0, 2, 1, 3)
 
     def forward(self, hidden_states, attention_mask):
-        mixed_query_layer = self.query(hidden_states)
+        mixed_query_layer = self.query(hidden_states)#32*128*768
         mixed_key_layer = self.key(hidden_states)
         mixed_value_layer = self.value(hidden_states)
 
-        query_layer = self.transpose_for_scores(mixed_query_layer)
+        query_layer = self.transpose_for_scores(mixed_query_layer)#32*12*128*64
         key_layer = self.transpose_for_scores(mixed_key_layer)
         value_layer = self.transpose_for_scores(mixed_value_layer)
+
+        '''# new attention
+        softmax_key = nn.Softmax(dim=-2)(key_layer+attention_mask.transpose(-1,-2))
+        softmax_query = nn.Softmax(dim=-2)(query_layer+attention_mask.transpose(-1,-2))
+        feature_layer = torch.matmul(softmax_key.permute(0,1,3,2),value_layer)
+        #feature_layer = self.dropout(feature_layer)
+        context_layer = torch.matmul(softmax_query,feature_layer)#/ math.sqrt(self.attention_head_size)'''
 
         # Take the dot product between "query" and "key" to get the raw attention scores.
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
         attention_scores = attention_scores / math.sqrt(self.attention_head_size)
         # Apply the attention mask is (precomputed for all layers in BertModel forward() function)
-        attention_scores = attention_scores + attention_mask
+        #mask 32*1*1*128
+        attention_scores = attention_scores + attention_mask#+self.mask1
+
 
         # Normalize the attention scores to probabilities.
         attention_probs = nn.Softmax(dim=-1)(attention_scores)
@@ -687,7 +709,7 @@ class BertModel(BertPreTrainedModel):
         self.pooler = BertPooler(config)
         self.apply(self.init_bert_weights)
 
-    def forward(self, input_ids, token_type_ids=None, attention_mask=None, output_all_encoded_layers=True):
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None, output_all_encoded_layers=True,label_ids=None):
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
         if token_type_ids is None:
@@ -708,7 +730,7 @@ class BertModel(BertPreTrainedModel):
         extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype) # fp16 compatibility
         extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
 
-        embedding_output = self.embeddings(input_ids, token_type_ids)
+        embedding_output = self.embeddings(input_ids, token_type_ids,label_ids)
         encoded_layers = self.encoder(embedding_output,
                                       extended_attention_mask,
                                       output_all_encoded_layers=output_all_encoded_layers)
@@ -775,9 +797,9 @@ class BertForPreTraining(BertPreTrainedModel):
         self.cls = BertPreTrainingHeads(config, self.bert.embeddings.word_embeddings.weight)
         self.apply(self.init_bert_weights)
 
-    def forward(self, input_ids, token_type_ids=None, attention_mask=None, masked_lm_labels=None, next_sentence_label=None):
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None, masked_lm_labels=None, next_sentence_label=None,label_ids=None):
         sequence_output, pooled_output = self.bert(input_ids, token_type_ids, attention_mask,
-                                                   output_all_encoded_layers=False)
+                                                   output_all_encoded_layers=False,label_ids=label_ids)
         prediction_scores, seq_relationship_score = self.cls(sequence_output, pooled_output)
 
         if masked_lm_labels is not None and next_sentence_label is not None:
@@ -965,16 +987,18 @@ class BertForSequenceClassification(BertPreTrainedModel):
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.classifier = nn.Linear(config.hidden_size, num_labels)
         self.apply(self.init_bert_weights)
+        self.ones=torch.tensor([1]).cuda()
 
-    def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None):
-        _, pooled_output = self.bert(input_ids, token_type_ids, attention_mask, output_all_encoded_layers=False)
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None,label_ids=None):
+        _, pooled_output = self.bert(input_ids, token_type_ids, attention_mask, output_all_encoded_layers=False,label_ids=label_ids)
         pooled_output = self.dropout(pooled_output)
         logits = self.classifier(pooled_output)
 
         if labels is not None:
             loss_fct = CrossEntropyLoss()
-            loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
-            return loss
+            self.ones=torch.tensor([1]*logits.shape[0]).cuda()
+            loss = loss_fct(logits.view(-1, self.num_labels), self.ones*labels)
+            return loss,logits
         else:
             return logits
 
