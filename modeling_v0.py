@@ -27,12 +27,15 @@ import tarfile
 import tempfile
 import sys
 from io import open
+import numpy as np
 
 import torch
 from torch import nn
 from torch.nn import CrossEntropyLoss
 
 from .file_utils import cached_path
+
+epoch_now=-1
 
 logger = logging.getLogger(__name__)
 
@@ -265,7 +268,7 @@ class BertEmbeddings(nn.Module):
 
 
 class BertSelfAttention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config,flag):
         super(BertSelfAttention, self).__init__()
         if config.hidden_size % config.num_attention_heads != 0:
             raise ValueError(
@@ -281,15 +284,57 @@ class BertSelfAttention(nn.Module):
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
 
+        self.first=True
+        self.flag=flag
+        self.count=0
+        self.last_epoch=0
+        self.init=False
+        self.dim_new=768
+
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
         x = x.view(*new_x_shape)
         return x.permute(0, 2, 1, 3)
 
+    def svd(self,mat,rank):
+        U,sigma,VT=np.linalg.svd(mat)
+        diag=np.sqrt(np.diag(sigma[:rank]))
+        return nn.Parameter(torch.from_numpy(np.matmul(U[:,:rank],diag)).float().cuda()),nn.Parameter(torch.from_numpy(np.matmul(diag,VT[:rank,:])).float().cuda())
+
     def forward(self, hidden_states, attention_mask):
-        mixed_query_layer = self.query(hidden_states)
-        mixed_key_layer = self.key(hidden_states)
-        mixed_value_layer = self.value(hidden_states)
+        if self.init==False:
+            self.qmat1,self.qmat2=self.svd(self.query.weight.detach().cpu().numpy(),1024)#1024 768
+            self.kmat1,self.kmat2=self.svd(self.key.weight.detach().cpu().numpy(),1024)#1024
+            self.vmat1,self.vmat2=self.svd(self.value.weight.detach().cpu().numpy(),1024)#1024
+
+            self.init=True
+        global epoch_now
+        if epoch_now>self.last_epoch:
+            self.last_epoch=epoch_now
+            self.count=0
+
+        if False and epoch_now==0 and self.flag*768<=self.count and (self.flag+1)*768>self.count:
+            sub_count=self.count%768
+            if sub_count<768:#768 576
+                self.qmat1=nn.Parameter(self.qmat1.detach()[:,:1024-sub_count])#1024 768
+                self.qmat2=nn.Parameter(self.qmat2.detach()[:1024-sub_count,:])#1024
+                self.kmat1=nn.Parameter(self.kmat1.detach()[:,:1024-sub_count])#1024
+                self.kmat2=nn.Parameter(self.kmat2.detach()[:1024-sub_count,:])#1024
+                self.vmat1=nn.Parameter(self.vmat1.detach()[:,:1024-sub_count])#1024
+                self.vmat2=nn.Parameter(self.vmat2.detach()[:1024-sub_count,:])#1024
+                #rank=sub_count//32
+                #mat=torch.matmul(self.qmat1.detach().cpu().numpy(),self.qmat2.detach().cpu().numpy())
+                #self.qmat1,self.qmat2=self.svd(mat,rank)
+                #mat=torch.matmul(self.kmat1.detach().cpu().numpy(),self.kmat2.detach().cpu().numpy())
+                #self.kmat1,self.kmat2=self.svd(mat,rank)
+                #mat=torch.matmul(self.vmat1.detach().cpu().numpy(),self.vmat2.detach().cpu().numpy())
+                #self.vmat1,self.vmat2=self.svd(mat,rank)
+
+        self.count+=1
+
+        mixed_query_layer = self.query(hidden_states)#torch.matmul(torch.matmul(hidden_states,self.qmat2.t()),self.qmat1.t())
+        mixed_key_layer = self.key(hidden_states)#torch.matmul(torch.matmul(hidden_states,self.kmat2.t()),self.kmat1.t())
+        mixed_value_layer = self.value(hidden_states)#torch.matmul(torch.matmul(hidden_states,self.vmat2.t()),self.vmat1.t())#self.value(hidden_states)
 
         query_layer = self.transpose_for_scores(mixed_query_layer)
         key_layer = self.transpose_for_scores(mixed_key_layer)
@@ -330,9 +375,9 @@ class BertSelfOutput(nn.Module):
 
 
 class BertAttention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config,flag):
         super(BertAttention, self).__init__()
-        self.self = BertSelfAttention(config)
+        self.self = BertSelfAttention(config,flag)
         self.output = BertSelfOutput(config)
 
     def forward(self, input_tensor, attention_mask):
@@ -371,9 +416,9 @@ class BertOutput(nn.Module):
 
 
 class BertLayer(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config,flag):
         super(BertLayer, self).__init__()
-        self.attention = BertAttention(config)
+        self.attention = BertAttention(config,flag)
         self.intermediate = BertIntermediate(config)
         self.output = BertOutput(config)
 
@@ -387,8 +432,12 @@ class BertLayer(nn.Module):
 class BertEncoder(nn.Module):
     def __init__(self, config):
         super(BertEncoder, self).__init__()
-        layer = BertLayer(config)
-        self.layer = nn.ModuleList([copy.deepcopy(layer) for _ in range(config.num_hidden_layers)])
+        lst=[]
+        for i in range(config.num_hidden_layers):
+            lst.append(BertLayer(config,i))
+        self.layer=nn.ModuleList(lst)
+        #layer = BertLayer(config)
+        #self.layer = nn.ModuleList([copy.deepcopy(layer) for _ in range(config.num_hidden_layers)])
 
     def forward(self, hidden_states, attention_mask, output_all_encoded_layers=True):
         all_encoder_layers = []
@@ -966,7 +1015,9 @@ class BertForSequenceClassification(BertPreTrainedModel):
         self.classifier = nn.Linear(config.hidden_size, num_labels)
         self.apply(self.init_bert_weights)
 
-    def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None):
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None,epoch=-1):
+        global epoch_now
+        epoch_now=epoch
         _, pooled_output = self.bert(input_ids, token_type_ids, attention_mask, output_all_encoded_layers=False)
         pooled_output = self.dropout(pooled_output)
         logits = self.classifier(pooled_output)
