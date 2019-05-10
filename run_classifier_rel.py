@@ -766,8 +766,8 @@ def main():
     #init quanzhi
     multiple = 2
     layer_wise = True
-    dim_wise = True
-    steps_per_move = 1
+    dim_wise = False
+    steps_per_move = 700*5
     gap = 384
 
     if args.bert_model == 'bert-large-uncased':
@@ -777,7 +777,7 @@ def main():
         layer_num = 12
         old_dim = 768
 
-    if True:
+    if False:
         for i in range(layer_num):
             pt = model.bert.encoder.layer[i].attention.self
             pt.qmat1, pt.qmat2 = svd(pt.query.weight.detach().cpu().numpy(), old_dim)
@@ -804,8 +804,8 @@ def main():
         model = BertForSequenceClassification(config, num_labels=num_labels)
         model.load_state_dict(torch.load(output_model_file))
     else:
-        output_model_file = os.path.join('/home/yujwang/maoyh/svd_weight_large', WEIGHTS_NAME)
-        output_config_file = os.path.join('/home/yujwang/maoyh/svd_weight_large', CONFIG_NAME)
+        output_model_file = os.path.join('/home/yujwang/maoyh/svd_weight', WEIGHTS_NAME)
+        output_config_file = os.path.join('/home/yujwang/maoyh/svd_weight', CONFIG_NAME)
         config = BertConfig(output_config_file)
         del model
         model = BertForSequenceClassification(config, num_labels=num_labels)
