@@ -720,7 +720,7 @@ class prune_function:
                                                               cache_dir=cache_dir,
                                                               num_labels=num_labels)'''
         PYTORCH_PRETRAINED_BERT_CACHE='./'
-        if True:
+        if False:
             cache_dir = args.cache_dir if args.cache_dir else os.path.join(str(PYTORCH_PRETRAINED_BERT_CACHE),
                                                                            'distributed_{}'.format(args.local_rank))
             model = BertForSequenceClassification.from_pretrained(args.bert_model,
@@ -740,8 +740,11 @@ class prune_function:
                 print('init weight finish')'''
         else:
             if args.bert_model == 'bert-base-uncased':
-                output_model_file = os.path.join('/home/yujwang/maoyh/svd_weight_2', WEIGHTS_NAME)
-                output_config_file = os.path.join('/home/yujwang/maoyh/svd_weight_2', CONFIG_NAME)
+                svd_weight = '/root/svd_weight'
+                if num_labels == 2:
+                    svd_weight += '_2'
+                output_model_file = os.path.join(svd_weight, WEIGHTS_NAME)
+                output_config_file = os.path.join(svd_weight, CONFIG_NAME)
             else:
                 output_model_file = os.path.join('/home/yujwang/maoyh/svd_weight_large', WEIGHTS_NAME)
                 output_config_file = os.path.join('/home/yujwang/maoyh/svd_weight_large', CONFIG_NAME)
@@ -890,8 +893,8 @@ class prune_function:
                     # to_change[sp].weight=torch.nn.Parameter(to_change[sp].weight.detach()*0)#*to_mask[sp])
                     # print(to_mask[sp],to_change[sp].weight)
                 now_step += 1
-                if now_step == all_steps:
-                    break
+                #if now_step == all_steps:
+                    #break
             out = {'epoch': epoch_i, 'loss': tr_loss / (step + 1), 'time': time.time() - start}
             logger.info("Train Loss: %s", out)
 
@@ -938,9 +941,9 @@ class prune_function:
                     best_acc=eval_accuracy
                 print(eval_accuracy,best_acc)
                 logger.info("Eval Loss: %s", result)
-                nni.report_intermediate_result(eval_accuracy)
-            if now_step == all_steps:
-                break
+                nni.report_intermediate_result(best_acc)
+            #if now_step == all_steps:
+                #break
         return best_acc
 
 def main():
@@ -1034,13 +1037,14 @@ def main():
     #prune_rate = [0.8] * 48
     func=prune_function(args)
 
-    prune_type = ['svd','vanilla','vanilla','vanilla']*12#['vanilla'] * 48
+    params = nni.get_next_parameter()
+    prune_type = ['vanilla'] * 48
     prune_rate=[0.5]*48
-    '''for i in range(48):
+    for i in range(48):
         if 'pr' + str(i) in params:
             prune_rate[i]=params['pr' + str(i)]
         if 'pt'+str(i) in params:
-            prune_type[i]=params['pt'+str(i)]'''
+            prune_type[i]=params['pt'+str(i)]
 
     def balance(prune_rate):
         rate_all = 0
@@ -1051,11 +1055,13 @@ def main():
             rate_one += whole_param[i % 4]
         rate_all /= rate_one
         for i in range(48):
-            prune_rate[i] = prune_rate[i] / rate_all * 0.5
+            prune_rate[i] = prune_rate[i] / rate_all * 0.3
         return prune_rate
 
     prune_rate = balance(prune_rate)
     acc=func.eval_after_train(prune_type,prune_rate)
+    nni.report_final_result(float(acc))
+    time.sleep(15)
     print('rep fin',acc)
 
 if __name__ == "__main__":
